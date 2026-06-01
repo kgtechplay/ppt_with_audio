@@ -78,8 +78,8 @@ def add_content_slide(prs, slide_data):
     body = slide.placeholders[1].text_frame
     body.clear()
 
-    for bullet in slide_data["bullets"]:
-        p = body.add_paragraph()
+    for index, bullet in enumerate(slide_data["bullets"]):
+        p = body.paragraphs[0] if index == 0 else body.add_paragraph()
         p.text = bullet
         p.level = 0
         p.font.size = Pt(22)

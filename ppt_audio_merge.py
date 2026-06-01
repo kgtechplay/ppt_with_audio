@@ -1,4 +1,4 @@
-"""Embed per-slide MP3 files into a PowerPoint deck using comtypes (not win32com)."""
+"""Embed per-slide MP3 files into a PowerPoint deck using comtypes."""
 
 import argparse
 import re
@@ -17,10 +17,7 @@ SLIDE_AUDIO_RE = re.compile(r"^slide_(\d+)\.mp3$", re.IGNORECASE)
 
 
 def build_audio_index(audio_dir: Path) -> dict[int, Path]:
-    """Map slide number -> MP3 for every slide_*.mp3 in the folder (any slide count).
-
-    Examples: slide_001.mp3 -> 1, slide_12.mp3 -> 12, slide_100.mp3 -> 100.
-    """
+    """Map slide number -> MP3 for every slide_*.mp3 in the folder."""
     index: dict[int, Path] = {}
     for path in sorted(audio_dir.glob("*.mp3")):
         match = SLIDE_AUDIO_RE.match(path.name)
@@ -54,9 +51,6 @@ def merge_audio_into_ppt(
     output_path = (output_path or output_path_for_ppt(ppt_path)).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    powerpoint = comtypes.client.CreateObject("PowerPoint.Application")
-    # Do not set Visible=False — Office 365 often blocks hiding the window.
-
     audio_by_slide = build_audio_index(audio_dir)
     if not audio_by_slide:
         raise RuntimeError(
@@ -65,12 +59,15 @@ def merge_audio_into_ppt(
         )
     print(f"Found {len(audio_by_slide)} audio file(s) in {audio_dir}")
 
-    presentation = powerpoint.Presentations.Open(str(ppt_path))
-    slide_count = presentation.Slides.Count
+    powerpoint = comtypes.client.CreateObject("PowerPoint.Application")
+    # Do not set Visible=False; Office 365 often blocks hiding the window.
+    presentation = None
     embedded = 0
     missing = []
 
     try:
+        presentation = powerpoint.Presentations.Open(str(ppt_path))
+        slide_count = presentation.Slides.Count
         for slide_number in range(1, slide_count + 1):
             audio_file = audio_by_slide.get(slide_number)
             if audio_file is None:
@@ -94,7 +91,8 @@ def merge_audio_into_ppt(
 
         presentation.SaveAs(str(output_path))
     finally:
-        presentation.Close()
+        if presentation is not None:
+            presentation.Close()
         powerpoint.Quit()
 
     if missing:

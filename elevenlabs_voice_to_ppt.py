@@ -1,12 +1,10 @@
-import os
 import argparse
+import os
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 from pptx import Presentation
-
-import win32com.client as win32
 
 
 load_dotenv()
@@ -117,6 +115,13 @@ def add_audio_to_ppt(
     show_powerpoint=False,
     progress_callback=None,
 ):
+    try:
+        import win32com.client as win32
+    except ImportError as exc:
+        raise RuntimeError(
+            "Embedding audio into PowerPoint requires pywin32 on Windows."
+        ) from exc
+
     powerpoint = win32.Dispatch("PowerPoint.Application")
     # Office 365+ often rejects Visible=False ("Hiding the application window
     # is not allowed"). Only force visible when requested; otherwise leave default.
@@ -124,39 +129,43 @@ def add_audio_to_ppt(
         powerpoint.Visible = True
     else:
         try:
-            powerpoint.DisplayAlerts = 0  # ppAlertsNone — fewer dialogs during automation
+            powerpoint.DisplayAlerts = 0  # ppAlertsNone; fewer dialogs during automation
         except Exception:
             pass
 
-    presentation = powerpoint.Presentations.Open(str(Path(input_pptx).resolve()))
-    total = len(audio_map)
+    presentation = None
+    try:
+        presentation = powerpoint.Presentations.Open(str(Path(input_pptx).resolve()))
+        total = len(audio_map)
 
-    for step, (slide_num, audio_file) in enumerate(audio_map.items(), start=1):
-        if progress_callback:
-            progress_callback(
-                step,
-                total,
-                f"Adding audio to slide {slide_num} ({step}/{total})",
+        for step, (slide_num, audio_file) in enumerate(audio_map.items(), start=1):
+            if progress_callback:
+                progress_callback(
+                    step,
+                    total,
+                    f"Adding audio to slide {slide_num} ({step}/{total})",
+                )
+
+            slide = presentation.Slides(slide_num)
+
+            audio_shape = slide.Shapes.AddMediaObject2(
+                FileName=str(audio_file.resolve()),
+                LinkToFile=False,
+                SaveWithDocument=True,
+                Left=20,
+                Top=20,
+                Width=40,
+                Height=40,
             )
 
-        slide = presentation.Slides(slide_num)
+            audio_shape.AnimationSettings.PlaySettings.PlayOnEntry = True
+            audio_shape.AnimationSettings.PlaySettings.HideWhileNotPlaying = True
 
-        audio_shape = slide.Shapes.AddMediaObject2(
-            FileName=str(audio_file.resolve()),
-            LinkToFile=False,
-            SaveWithDocument=True,
-            Left=20,
-            Top=20,
-            Width=40,
-            Height=40,
-        )
-
-        audio_shape.AnimationSettings.PlaySettings.PlayOnEntry = True
-        audio_shape.AnimationSettings.PlaySettings.HideWhileNotPlaying = True
-
-    presentation.SaveAs(str(Path(output_pptx).resolve()))
-    presentation.Close()
-    powerpoint.Quit()
+        presentation.SaveAs(str(Path(output_pptx).resolve()))
+    finally:
+        if presentation is not None:
+            presentation.Close()
+        powerpoint.Quit()
 
 
 def run_elevenlabs_audio(

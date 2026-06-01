@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 import streamlit as st
@@ -85,16 +84,14 @@ def run_content_pipeline(
     status.write(f"Saved audio: `{audio_dir.relative_to(BASE_DIR)}/`")
 
     status.write("Step 3/3: Merging audio into PowerPoint")
-    progress_handler = make_progress_handler(progress_bar, status, 2 / 3, 1 / 3)
-
-    merged_name = f"{ppt_path.stem} + audio.pptx"
-    merged_path = job_dir / merged_name
+    merged_path = job_dir / f"{ppt_path.stem} + audio.pptx"
 
     merge_audio_into_ppt(
         ppt_path=notes_path,
         audio_dir=audio_dir,
         output_path=merged_path,
     )
+    progress_bar.progress(1.0)
     status.write(f"Saved: `{merged_path.relative_to(BASE_DIR)}`")
 
     return {
@@ -140,14 +137,13 @@ def run_existing_ppt_pipeline(
     status.write(f"Saved audio: `{audio_dir.relative_to(BASE_DIR)}/`")
 
     status.write("Step 3/3: Merging audio into PowerPoint")
-    progress_handler = make_progress_handler(progress_bar, status, 2 / 3, 1 / 3)
-
     merged_path = job_dir / f"{notes_path.stem} + audio.pptx"
     merge_audio_into_ppt(
         ppt_path=notes_path,
         audio_dir=audio_dir,
         output_path=merged_path,
     )
+    progress_bar.progress(1.0)
     status.write(f"Saved: `{merged_path.relative_to(BASE_DIR)}`")
 
     return {
@@ -160,13 +156,13 @@ def run_existing_ppt_pipeline(
 
 st.set_page_config(
     page_title="Voice PPT Generator",
-    page_icon="🎙️",
+    page_icon=":studio_microphone:",
     layout="centered",
 )
 
 st.title("Voice PPT Generator")
 st.caption(
-    "From content or PowerPoint → speaker notes → ElevenLabs audio → merged deck. "
+    "From content or PowerPoint -> speaker notes -> ElevenLabs audio -> merged deck. "
     f"Outputs go to `{OUTPUT_DIR.name}/<input-file-name>/`."
 )
 
