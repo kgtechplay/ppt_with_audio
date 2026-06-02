@@ -17,6 +17,7 @@ class ContentSlideStyle:
     drop_cap_id: int | None
     drop_cap_body_id: int | None
     repeated_component_ids: list[int]
+    repeated_component_description_ids: list[int]
     use_body_region: bool
     use_repeated_components: bool
     deletable_text_ids: set[int]
@@ -128,6 +129,48 @@ def repeated_component_items(shapes):
     return sorted(by_id.values(), key=lambda item: (item["top"], item["left"]))
 
 
+def row_component_pairs(shapes):
+    pairs = []
+    for heading in shapes:
+        if looks_like_footer_text(heading["text"]):
+            continue
+        if word_count(heading["text"]) > 5:
+            continue
+        if heading["height"] > 48:
+            continue
+        if heading["width"] < 180:
+            continue
+
+        candidates = []
+        for description in shapes:
+            if description["id"] == heading["id"]:
+                continue
+            if description["top"] <= heading["top"]:
+                continue
+            if description["top"] - (heading["top"] + heading["height"]) > 24:
+                continue
+            if abs(description["left"] - heading["left"]) > 45:
+                continue
+            if abs(description["width"] - heading["width"]) > max(90, heading["width"] * 0.2):
+                continue
+            if word_count(description["text"]) < 6:
+                continue
+            candidates.append(description)
+
+        if candidates:
+            pairs.append((heading, min(candidates, key=lambda item: item["top"])))
+
+    if len(pairs) < 2:
+        return []
+
+    lefts = [heading["left"] for heading, _ in pairs]
+    widths = [heading["width"] for heading, _ in pairs]
+    if max(widths) - min(widths) > max(120, max(widths) * 0.25):
+        return []
+
+    return sorted(pairs, key=lambda pair: (pair[0]["top"], pair[0]["left"]))
+
+
 def choose_title_shape(shapes):
     def score(item):
         lower = item["lower"]
@@ -191,7 +234,10 @@ def choose_content_title_shape(shapes):
 
 
 def choose_content_body_shape(shapes, title_shape):
+    row_pairs = row_component_pairs(shapes)
     component_ids = {item["id"] for item in repeated_component_items(shapes)}
+    component_ids.update(heading["id"] for heading, _ in row_pairs)
+    component_ids.update(description["id"] for _, description in row_pairs)
     drop_cap_item, drop_cap_partner = drop_cap_body_pair(shapes)
 
     def score(item):
@@ -232,7 +278,10 @@ def detect_title_slide_style(shapes) -> TitleSlideStyle:
 
 def detect_content_slide_style(shapes) -> ContentSlideStyle:
     title_shape = choose_content_title_shape(shapes)
+    row_pairs = row_component_pairs(shapes)
     repeated_components = repeated_component_items(shapes)
+    if row_pairs and not repeated_components:
+        repeated_components = [heading for heading, _ in row_pairs]
     body_shape = choose_content_body_shape(shapes, title_shape)
     drop_cap_item, drop_cap_partner = drop_cap_body_pair(shapes)
 
@@ -247,6 +296,12 @@ def detect_content_slide_style(shapes) -> ContentSlideStyle:
         if item is not None
     }
     component_ids = {item["id"] for item in repeated_components}
+    repeated_component_id_set = {component["id"] for component in repeated_components}
+    component_description_ids = {
+        description["id"]
+        for heading, description in row_pairs
+        if heading["id"] in repeated_component_id_set
+    }
     footer_ids = {item["id"] for item in shapes if looks_like_footer_text(item["text"])}
 
     deletable_text_ids = {
@@ -254,6 +309,7 @@ def detect_content_slide_style(shapes) -> ContentSlideStyle:
         for item in shapes
         if item["id"] not in protected_ids
         and item["id"] not in component_ids
+        and item["id"] not in component_description_ids
         and item["id"] not in footer_ids
     }
 
@@ -263,6 +319,11 @@ def detect_content_slide_style(shapes) -> ContentSlideStyle:
         drop_cap_id=drop_cap_item["id"] if drop_cap_item else None,
         drop_cap_body_id=drop_cap_partner["id"] if drop_cap_partner else None,
         repeated_component_ids=[item["id"] for item in repeated_components],
+        repeated_component_description_ids=[
+            description["id"]
+            for heading, description in row_pairs
+            if heading["id"] in repeated_component_id_set
+        ],
         use_body_region=use_body_region,
         use_repeated_components=use_repeated_components,
         deletable_text_ids=deletable_text_ids,

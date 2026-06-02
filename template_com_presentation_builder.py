@@ -401,6 +401,14 @@ def _fill_repeated_components(slide, components, values, protected_ids, logger=N
     for item in components[len(values):]:
         if item["id"] in deleted_ids:
             continue
+        description_item = description_by_component_id.get(item["id"])
+        if description_item is not None and description_item["id"] not in deleted_ids:
+            if logger:
+                logger.write(
+                    f"delete unused component description {_item_summary(description_item)}"
+                )
+            _delete_shape(description_item["shape"])
+            deleted_ids.add(description_item["id"])
         deleted_ids.update(_delete_unused_component(slide, item, protected_ids=protected_ids, logger=logger))
 
     return used_ids, deleted_ids
@@ -664,13 +672,24 @@ def _split_component_value(value: str) -> tuple[str, str]:
     return " ".join(words[:6]), " ".join(words[6:])
 
 
-def _fill_repeated_card_components(slide, components, values, protected_ids, all_text_items, logger=None):
+def _fill_repeated_card_components(
+    slide,
+    components,
+    values,
+    protected_ids,
+    all_text_items,
+    logger=None,
+    description_by_component_id=None,
+):
     used_ids = set()
     deleted_ids = set()
+    description_by_component_id = description_by_component_id or {}
 
     for item, value in zip(components, values):
         title_text, description_text = _split_component_value(value)
-        description_item = _component_description_item(slide, item, all_text_items)
+        description_item = description_by_component_id.get(item["id"])
+        if description_item is None:
+            description_item = _component_description_item(slide, item, all_text_items)
 
         _set_shape_text(item["shape"], title_text)
         if logger:
@@ -765,6 +784,14 @@ def _replace_content_slide_text(slide, title: str, bullets: list[str], logger=No
         if shape_id in shape_by_id
     ]
     body_shape = shape_by_id.get(style.body_id)
+    description_by_component_id = {
+        component_id: shape_by_id[description_id]
+        for component_id, description_id in zip(
+            style.repeated_component_ids,
+            style.repeated_component_description_ids,
+        )
+        if component_id in shape_by_id and description_id in shape_by_id
+    }
     use_body_region = style.use_body_region
     use_repeated_components = style.use_repeated_components
     protected_ids = set()
@@ -785,6 +812,7 @@ def _replace_content_slide_text(slide, title: str, bullets: list[str], logger=No
         logger.write(
             "style model: "
             f"drop_cap_id={style.drop_cap_id}, drop_cap_body_id={style.drop_cap_body_id}, "
+            f"repeated_description_ids={style.repeated_component_description_ids}, "
             f"deletable_text_ids={sorted(style.deletable_text_ids)}, "
             f"footer_ids={sorted(style.footer_ids)}"
         )
@@ -809,6 +837,7 @@ def _replace_content_slide_text(slide, title: str, bullets: list[str], logger=No
             protected_ids,
             shapes,
             logger=logger,
+            description_by_component_id=description_by_component_id,
         )
         deleted_ids.update(component_deleted_ids)
     elif repeated_components:
