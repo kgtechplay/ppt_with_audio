@@ -14,6 +14,8 @@ BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 
 AUDIO_SUBDIR = "Audio"
+TEMPLATE_SUBDIR = "template"
+LOGS_SUBDIR = "logs"
 
 
 def job_dir_for_source(source_filename: str) -> Path:
@@ -23,11 +25,30 @@ def job_dir_for_source(source_filename: str) -> Path:
     return job_dir
 
 
+def new_job_dir_for_source(source_filename: str) -> Path:
+    """Create a fresh output/<input-file-stem>/ folder, suffixing when needed."""
+    job_dir = unique_path((OUTPUT_DIR / Path(source_filename).stem).resolve())
+    job_dir.mkdir(parents=True, exist_ok=False)
+    return job_dir
+
+
 def save_upload(uploaded_file, target_dir: Path) -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
-    target_path = target_dir / uploaded_file.name
+    target_path = unique_path(target_dir / uploaded_file.name)
     target_path.write_bytes(uploaded_file.getbuffer())
     return target_path
+
+
+def unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+
+    index = 2
+    while True:
+        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        index += 1
 
 
 def make_progress_handler(progress_bar, status_text, step_offset=0, step_weight=1.0):
@@ -39,8 +60,8 @@ def make_progress_handler(progress_bar, status_text, step_offset=0, step_weight=
     return handler
 
 
-def render_download(path: Path, label: str):
-    if path.exists():
+def render_download(path: Path | None, label: str):
+    if path and path.exists():
         st.download_button(
             label=label,
             data=path.read_bytes(),
@@ -51,27 +72,49 @@ def render_download(path: Path, label: str):
 
 def run_content_pipeline(
     content_path: Path,
+    job_dir: Path,
     topic: str,
     num_slides: int,
+    template_path: Path | None,
+    skip_audio: bool,
     progress_bar,
     status,
 ) -> dict[str, Path]:
     """Content .txt -> PPT with notes -> Audio/ -> merged PPT."""
-    job_dir = job_dir_for_source(content_path.name)
     ppt_path = job_dir / f"{content_path.stem}.pptx"
     audio_dir = job_dir / AUDIO_SUBDIR
+    logs_dir = job_dir / LOGS_SUBDIR
 
-    status.write("Step 1/3: Creating presentation with speaker notes")
-    progress_handler = make_progress_handler(progress_bar, status, 0.0, 1 / 3)
+    total_steps = 1 if skip_audio else 3
+    status.write(f"Step 1/{total_steps}: Creating presentation with speaker notes")
+    progress_handler = make_progress_handler(
+        progress_bar,
+        status,
+        0.0,
+        1.0 if skip_audio else 1 / 3,
+    )
 
     notes_path = run_create_presentation(
         content_path=content_path,
         output_path=ppt_path,
         topic=topic,
         num_slides=num_slides,
+        template_path=template_path,
+        logs_dir=logs_dir,
         progress_callback=progress_handler,
     )
     status.write(f"Saved: `{notes_path.relative_to(BASE_DIR)}`")
+
+    if skip_audio:
+        progress_bar.progress(1.0)
+        status.write("Skipping audio generation and merge.")
+        return {
+            "job_dir": job_dir,
+            "presentation": notes_path,
+            "audio_dir": audio_dir,
+            "logs_dir": logs_dir,
+            "merged": None,
+        }
 
     status.write("Step 2/3: Generating narration (ElevenLabs)")
     progress_handler = make_progress_handler(progress_bar, status, 1 / 3, 1 / 3)
@@ -98,6 +141,7 @@ def run_content_pipeline(
         "job_dir": job_dir,
         "presentation": notes_path,
         "audio_dir": audio_dir,
+        "logs_dir": logs_dir,
         "merged": merged_path,
     }
 
@@ -179,6 +223,8 @@ st.divider()
 ppt_upload = None
 content_upload = None
 context_upload = None
+template_upload = None
+template_detection_only = False
 
 if mode == "Content file (text)":
     st.subheader("Content")
@@ -196,6 +242,16 @@ if mode == "Content file (text)":
         max_value=30,
         value=8,
         help="Includes 1 title slide plus the remaining content slides.",
+    )
+    template_upload = st.file_uploader(
+        "Optional PowerPoint template (.pptx)",
+        type=["pptx"],
+        help="When provided, the generated deck uses the template's title/content layouts and theme.",
+    )
+    template_detection_only = st.checkbox(
+        "Analyze template and create PPT only",
+        value=False,
+        help="Creates the styled PowerPoint with speaker notes, then skips audio generation and merge.",
     )
     context_text = ""
 else:
@@ -224,6 +280,10 @@ if generate:
         st.error("Please upload a content file.")
         st.stop()
 
+    if mode == "Content file (text)" and template_detection_only and not template_upload:
+        st.error("Please upload a PowerPoint template to analyze.")
+        st.stop()
+
     if mode == "PowerPoint without speaker notes" and not ppt_upload:
         st.error("Please upload a PowerPoint file.")
         st.stop()
@@ -236,12 +296,23 @@ if generate:
     try:
         with st.status("Running pipeline...", expanded=True) as status:
             if mode == "Content file (text)":
-                job_dir = job_dir_for_source(content_upload.name)
+                job_dir = new_job_dir_for_source(content_upload.name)
+                template_path = None
+                if template_upload:
+                    template_dir = job_dir / TEMPLATE_SUBDIR
+                    template_path = save_upload(template_upload, template_dir)
+
+                if template_detection_only:
+                    status.write("Template analysis logs will be saved in the output logs folder")
+
                 content_path = save_upload(content_upload, job_dir)
                 results = run_content_pipeline(
                     content_path=content_path,
+                    job_dir=job_dir,
                     topic=topic,
                     num_slides=int(num_slides),
+                    template_path=template_path,
+                    skip_audio=template_detection_only,
                     progress_bar=progress_bar,
                     status=status,
                 )
@@ -276,10 +347,13 @@ if generate:
             )
 
         with col2:
-            render_download(
-                results["merged"],
-                "Download narrated presentation",
-            )
+            if results["merged"]:
+                render_download(
+                    results["merged"],
+                    "Download narrated presentation",
+                )
+            else:
+                st.info("Audio generation and merge were skipped.")
 
         audio_dir = results["audio_dir"]
         audio_paths = sorted(audio_dir.glob("*.mp3")) if audio_dir.exists() else []
@@ -292,10 +366,17 @@ if generate:
         with log_area:
             st.markdown("**Output folder**")
             st.code(str(results["job_dir"]))
-            st.caption(
-                f"Contains the .pptx with speaker notes, "
-                f"`{AUDIO_SUBDIR}/slide_*.mp3`, and the merged `* + audio.pptx`."
-            )
+            if results["merged"]:
+                st.caption(
+                    f"Contains the .pptx with speaker notes, "
+                    f"`{AUDIO_SUBDIR}/slide_*.mp3`, the merged `* + audio.pptx`, "
+                    f"and `{LOGS_SUBDIR}/` logs."
+                )
+            else:
+                st.caption(
+                    f"Contains the generated .pptx with speaker notes and `{LOGS_SUBDIR}/` logs. "
+                    "Audio was skipped."
+                )
 
     except Exception as exc:
         progress_bar.empty()
