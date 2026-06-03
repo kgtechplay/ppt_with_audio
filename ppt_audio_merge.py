@@ -5,6 +5,7 @@ import re
 import sys
 from pathlib import Path
 
+import comtypes
 import comtypes.client
 
 
@@ -59,6 +60,8 @@ def merge_audio_into_ppt(
         )
     print(f"Found {len(audio_by_slide)} audio file(s) in {audio_dir}")
 
+    # Streamlit can run code on worker threads; COM must be initialized per-thread.
+    comtypes.CoInitialize()
     powerpoint = comtypes.client.CreateObject("PowerPoint.Application")
     # Do not set Visible=False; Office 365 often blocks hiding the window.
     presentation = None
@@ -94,6 +97,7 @@ def merge_audio_into_ppt(
         if presentation is not None:
             presentation.Close()
         powerpoint.Quit()
+        comtypes.CoUninitialize()
 
     if missing:
         print(f"Warning: no audio for slide(s): {', '.join(map(str, missing))}")

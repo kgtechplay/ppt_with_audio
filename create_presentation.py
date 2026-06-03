@@ -7,6 +7,12 @@ from openai import OpenAI
 from pptx import Presentation
 from pptx.util import Pt
 
+from template_com_presentation_builder import build_presentation_from_template_com
+from template_layout_detector import (
+    detect_template_layout,
+    format_template_detection_report,
+)
+
 load_dotenv()
 client = OpenAI()
 
@@ -15,6 +21,12 @@ You create professional PowerPoint presentations.
 Return ONLY valid JSON.
 Do not include markdown.
 """
+
+
+def safe_print(text: str) -> None:
+    encoding = sys.stdout.encoding or "utf-8"
+    safe_text = text.encode(encoding, errors="replace").decode(encoding)
+    print(safe_text, flush=True)
 
 
 def load_file(path):
@@ -99,11 +111,65 @@ def build_presentation(plan, output_file):
     prs.save(output_file)
 
 
+def build_presentation_with_optional_template(
+    plan,
+    output_file,
+    template_path=None,
+    logs_dir=None,
+    progress_callback=None,
+):
+    if not template_path:
+        build_presentation(plan, output_file)
+        return output_file
+
+    try:
+        profile = detect_template_layout(template_path)
+        output_file = Path(output_file)
+        logs_dir = Path(logs_dir) if logs_dir else output_file.with_name("logs")
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        detection_report_path = logs_dir / f"{output_file.stem}_template_detection.log"
+        detection_report = format_template_detection_report(template_path, profile)
+        detection_report_path.write_text(detection_report, encoding="utf-8")
+        safe_print(detection_report)
+
+        if not profile.title_slide_index or not profile.content_slide_index:
+            raise ValueError("Could not identify title and content sample slides in template.")
+
+        debug_log_path = logs_dir / f"{output_file.stem}_template_debug.log"
+        return build_presentation_from_template_com(
+            plan,
+            output_file,
+            profile,
+            debug_log_path=debug_log_path,
+        )
+    except Exception as exc:
+        output_file = Path(output_file)
+        logs_dir = Path(logs_dir) if logs_dir else output_file.with_name("logs")
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        fallback_log_path = logs_dir / f"{output_file.stem}_template_fallback.log"
+        fallback_message = (
+            f"Template styling failed with {type(exc).__name__}: {exc}\n"
+            "Falling back to default PowerPoint layout.\n"
+        )
+        fallback_log_path.write_text(fallback_message, encoding="utf-8")
+        safe_print(fallback_message)
+        if progress_callback:
+            progress_callback(
+                2,
+                3,
+                f"Template styling failed ({exc}); using default PowerPoint layout",
+            )
+        build_presentation(plan, output_file)
+        return output_file
+
+
 def run_create_presentation(
     content_path,
     output_path=None,
     topic="Business Presentation",
     num_slides=8,
+    template_path=None,
+    logs_dir=None,
     progress_callback=None,
 ):
     content_path = Path(content_path)
@@ -121,9 +187,18 @@ def run_create_presentation(
     plan = create_slide_plan(content, topic=topic, num_slides=num_slides)
 
     if progress_callback:
-        progress_callback(2, 3, f"Building presentation ({len(plan['slides'])} slides)")
+        if template_path:
+            progress_callback(2, 3, "Building presentation from template")
+        else:
+            progress_callback(2, 3, f"Building presentation ({len(plan['slides'])} slides)")
 
-    build_presentation(plan, output_path)
+    build_presentation_with_optional_template(
+        plan=plan,
+        output_file=output_path,
+        template_path=template_path,
+        logs_dir=logs_dir,
+        progress_callback=progress_callback,
+    )
 
     if progress_callback:
         progress_callback(3, 3, "Presentation saved")

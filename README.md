@@ -21,6 +21,8 @@ streamlit run app.py
 
 Outputs are written to `output/<input-file-name>/` (presentation, `Audio/` MP3s, and merged `* + audio.pptx`).
 
+The web UI can optionally accept a PowerPoint template. Template mode detects reusable title and content sample slides, duplicates those slides through PowerPoint COM, replaces mapped text, and writes template detection/debug logs under the job output folder. When slide scoring is ambiguous, the detector uses OpenAI to choose the best reusable sample slide and falls back to heuristic scoring if the AI call fails.
+
 ## CLI pipeline
 
 ```powershell
@@ -32,4 +34,5 @@ python ppt_audio_merge.py "output/content/content.pptx" "output/content/Audio"
 ## Requirements
 
 - Windows + Microsoft PowerPoint (for `ppt_audio_merge.py` via COM)
+- Windows + Microsoft PowerPoint for template-based deck generation via COM
 - OpenAI and ElevenLabs API keys
