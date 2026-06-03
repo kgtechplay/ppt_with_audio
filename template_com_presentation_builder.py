@@ -1,28 +1,45 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 from pptx import Presentation
 
 from template_layout_detector import TemplateLayoutProfile
-from template_style_detector import detect_content_slide_style, detect_title_slide_style
+from template_style_detector import (
+    detect_content_slide_style,
+    detect_title_slide_style,
+    drop_cap_body_pair,
+    looks_like_footer_text,
+)
 
 
+# Prints text without crashing when the Windows console cannot encode a symbol.
+def _safe_print(text: str) -> None:
+    encoding = sys.stdout.encoding or "utf-8"
+    safe_text = text.encode(encoding, errors="replace").decode(encoding)
+    print(safe_text, flush=True)
+
+
+# Writes build progress to stdout and an optional debug log file.
 class _DebugLogger:
+    # Initializes or clears the debug log file.
     def __init__(self, log_path: Path | None):
         self.log_path = log_path
         if self.log_path:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             self.log_path.write_text("", encoding="utf-8")
 
+    # Appends a single formatted debug line.
     def write(self, message: str) -> None:
         line = f"[template-com] {message}"
-        print(line, flush=True)
+        _safe_print(line)
         if self.log_path:
             with self.log_path.open("a", encoding="utf-8") as file:
                 file.write(line + "\n")
 
 
+# Shortens long text for readable debug messages.
 def _preview(text: str, limit: int = 90) -> str:
     text = " ".join((text or "").split())
     if len(text) <= limit:
@@ -30,11 +47,13 @@ def _preview(text: str, limit: int = 90) -> str:
     return text[: limit - 3] + "..."
 
 
+# Formats a shape item dict into a compact debug string.
 def _item_summary(item) -> str:
+    font_part = f" font={item.get('font_size'):.1f}" if item.get("font_size") else ""
     return (
         f"id={item.get('id')} parents={item.get('parent_ids', ())} "
         f"box=({item.get('left'):.0f},{item.get('top'):.0f},"
-        f"{item.get('width'):.0f},{item.get('height'):.0f}) "
+        f"{item.get('width'):.0f},{item.get('height'):.0f}){font_part} "
         f"text='{_preview(item.get('text', ''))}'"
     )
 
@@ -58,14 +77,7 @@ PLACEHOLDER_WORDS = (
     "add a sentence",
 )
 
-REPEATED_COMPONENT_WORDS = (
-    "highlight",
-    "metric",
-    "insight",
-    "callout",
-)
-
-
+# Reads a COM shape's position and size.
 def _shape_bounds(shape) -> tuple[float, float, float, float] | None:
     try:
         return (
@@ -78,6 +90,7 @@ def _shape_bounds(shape) -> tuple[float, float, float, float] | None:
         return None
 
 
+# Reads a COM shape's stable slide-local id.
 def _shape_id(shape) -> int | None:
     try:
         return int(shape.Id)
@@ -85,6 +98,29 @@ def _shape_id(shape) -> int | None:
         return None
 
 
+# Reads the largest available font size from a COM text shape.
+def _shape_font_size(shape) -> float | None:
+    try:
+        text_range = shape.TextFrame.TextRange
+        font_size = float(text_range.Font.Size)
+        if font_size > 0:
+            return font_size
+    except Exception:
+        pass
+
+    try:
+        text_range = shape.TextFrame.TextRange
+        sizes = []
+        for index in range(1, text_range.Runs().Count + 1):
+            run_size = float(text_range.Runs(index).Font.Size)
+            if run_size > 0:
+                sizes.append(run_size)
+        return max(sizes) if sizes else None
+    except Exception:
+        return None
+
+
+# Walks top-level and grouped shapes while preserving parent group ids.
 def _iter_shape_tree(shapes_collection, parent_ids=()):
     for index in range(1, shapes_collection.Count + 1):
         shape = shapes_collection(index)
@@ -104,6 +140,7 @@ def _iter_shape_tree(shapes_collection, parent_ids=()):
             yield from _iter_shape_tree(group_items, parent_ids + (shape_id,))
 
 
+# Extracts stripped text from a COM shape when it has a text frame.
 def _text(shape) -> str:
     try:
         if not shape.HasTextFrame:
@@ -115,6 +152,7 @@ def _text(shape) -> str:
         return ""
 
 
+# Collects text-bearing shapes from a slide as detector-friendly dictionaries.
 def _text_shapes(slide):
     shapes = []
     for shape, parent_ids in _iter_shape_tree(slide.Shapes):
@@ -126,6 +164,7 @@ def _text_shapes(slide):
             continue
         left, top, width, height = bounds
         shape_id = _shape_id(shape)
+        font_size = _shape_font_size(shape)
         shapes.append(
             {
                 "shape": shape,
@@ -138,11 +177,13 @@ def _text_shapes(slide):
                 "width": width,
                 "height": height,
                 "area": width * height,
+                "font_size": font_size,
             }
         )
     return sorted(shapes, key=lambda item: (item["top"], item["left"]))
 
 
+# Collects all shapes from a slide as geometry dictionaries for deletion/protection logic.
 def _all_shape_items(slide):
     items = []
     for shape, parent_ids in _iter_shape_tree(slide.Shapes):
@@ -171,10 +212,12 @@ def _all_shape_items(slide):
     return items
 
 
+# Looks up a PowerPoint slide by its SlideID.
 def _slide_by_id(presentation, slide_id):
     return presentation.Slides.FindBySlideID(slide_id)
 
 
+# Duplicates a source slide and moves the duplicate to the end of the deck.
 def _duplicate_to_end(presentation, source_slide_id):
     source = _slide_by_id(presentation, source_slide_id)
     duplicate_range = source.Duplicate()
@@ -183,11 +226,21 @@ def _duplicate_to_end(presentation, source_slide_id):
     return presentation.Slides(presentation.Slides.Count)
 
 
+# Replaces all text in a COM text shape.
 def _set_shape_text(shape, text: str) -> None:
     text_range = shape.TextFrame.TextRange
     text_range.Text = text
 
 
+# Sets a text shape's font size across its text range.
+def _set_shape_font_size(shape, font_size: float) -> None:
+    try:
+        shape.TextFrame.TextRange.Font.Size = font_size
+    except Exception:
+        pass
+
+
+# Clears text from a COM text shape without failing the build.
 def _clear_shape_text(shape) -> None:
     try:
         shape.TextFrame.TextRange.Text = ""
@@ -195,6 +248,7 @@ def _clear_shape_text(shape) -> None:
         pass
 
 
+# Deletes a COM shape without failing the build.
 def _delete_shape(shape) -> None:
     try:
         shape.Delete()
@@ -202,6 +256,7 @@ def _delete_shape(shape) -> None:
         pass
 
 
+# Computes the slide area used for relative geometry thresholds.
 def _slide_area(slide) -> float:
     try:
         setup = slide.Parent.PageSetup
@@ -210,10 +265,21 @@ def _slide_area(slide) -> float:
         return 720 * 540
 
 
+# Reads the slide dimensions used for fit calculations.
+def _slide_size(slide) -> tuple[float, float]:
+    try:
+        setup = slide.Parent.PageSetup
+        return float(setup.SlideWidth), float(setup.SlideHeight)
+    except Exception:
+        return 720, 540
+
+
+# Checks whether a point falls inside a shape item rectangle.
 def _contains_point(item, x, y) -> bool:
     return item["left"] <= x <= item["right"] and item["top"] <= y <= item["bottom"]
 
 
+# Checks whether two shape item rectangles overlap.
 def _overlaps(a, b) -> bool:
     return not (
         a["right"] < b["left"]
@@ -223,6 +289,7 @@ def _overlaps(a, b) -> bool:
     )
 
 
+# Returns a copy of a shape item rectangle expanded by padding.
 def _expanded(item, padding) -> dict:
     return {
         **item,
@@ -233,6 +300,182 @@ def _expanded(item, padding) -> dict:
     }
 
 
+# Returns the rendered text bounds reported by PowerPoint.
+def _text_render_size(shape) -> tuple[float, float] | None:
+    try:
+        text_range = shape.TextFrame2.TextRange
+        return float(text_range.BoundWidth), float(text_range.BoundHeight)
+    except Exception:
+        pass
+
+    try:
+        text_range = shape.TextFrame.TextRange
+        return float(text_range.BoundWidth), float(text_range.BoundHeight)
+    except Exception:
+        return None
+
+
+# Checks whether rendered text is larger than its shape box.
+def _text_overflows_shape(shape, padding=4) -> bool:
+    bounds = _shape_bounds(shape)
+    render_size = _text_render_size(shape)
+    if bounds is None or render_size is None:
+        return False
+
+    _, _, width, height = bounds
+    rendered_width, rendered_height = render_size
+    return rendered_width > width - padding or rendered_height > height - padding
+
+
+# Finds the rightmost edge a shape can grow to without hitting another shape.
+def _available_right_edge(slide, item, padding=10) -> float:
+    slide_width, _ = _slide_size(slide)
+    limit = slide_width - padding
+    item_bottom = item["top"] + item["height"]
+
+    for other in _all_shape_items(slide):
+        if other["id"] == item["id"]:
+            continue
+        overlaps_vertically = not (
+            other["bottom"] < item["top"] + padding
+            or other["top"] > item_bottom - padding
+        )
+        if overlaps_vertically and other["left"] >= item["left"] + item["width"]:
+            limit = min(limit, other["left"] - padding)
+
+    return max(item["left"] + item["width"], limit)
+
+
+# Finds the lowest edge a shape can grow to without hitting another shape.
+def _available_bottom_edge(slide, item, padding=10) -> float:
+    _, slide_height = _slide_size(slide)
+    limit = slide_height - padding
+    item_right = item["left"] + item["width"]
+
+    for other in _all_shape_items(slide):
+        if other["id"] == item["id"]:
+            continue
+        overlaps_horizontally = not (
+            other["right"] < item["left"] + padding
+            or other["left"] > item_right - padding
+        )
+        if overlaps_horizontally and other["top"] >= item["top"] + item["height"]:
+            limit = min(limit, other["top"] - padding)
+
+    return max(item["top"] + item["height"], limit)
+
+
+# Expands a text box into empty space before resorting to font shrinking.
+def _grow_text_shape_to_fit(slide, item, logger=None) -> None:
+    shape = item["shape"]
+    render_size = _text_render_size(shape)
+    if render_size is None:
+        return
+
+    rendered_width, rendered_height = render_size
+    right_edge = _available_right_edge(slide, item)
+    max_width = max(item["width"], right_edge - item["left"])
+    if rendered_height > item["height"] - 4:
+        desired_width = max_width
+    else:
+        desired_width = min(max_width, max(item["width"], rendered_width + 12))
+    if desired_width > item["width"] + 1:
+        try:
+            shape.Width = desired_width
+            if logger:
+                logger.write(
+                    f"expanded text box width id={item['id']} "
+                    f"from {item['width']:.0f} to {desired_width:.0f}"
+                )
+        except Exception:
+            pass
+
+    bounds = _shape_bounds(shape)
+    if bounds is None:
+        return
+
+    left, top, width, height = bounds
+    render_size = _text_render_size(shape)
+    rendered_height = render_size[1] if render_size is not None else rendered_height
+    current_item = {**item, "left": left, "top": top, "width": width, "height": height}
+    bottom_edge = _available_bottom_edge(slide, current_item)
+    max_height = max(height, bottom_edge - top)
+    desired_height = min(max_height, max(height, rendered_height + 10))
+    if desired_height > height + 1:
+        try:
+            shape.Height = desired_height
+            if logger:
+                logger.write(
+                    f"expanded text box height id={item['id']} "
+                    f"from {height:.0f} to {desired_height:.0f}"
+                )
+        except Exception:
+            pass
+
+
+# Reduces font size until rendered text fits inside its box.
+def _shrink_text_to_fit(shape, item, logger=None, min_font_size=8.0) -> None:
+    font_size = _shape_font_size(shape)
+    if not font_size:
+        return
+
+    current_size = font_size
+    while current_size > min_font_size and _text_overflows_shape(shape):
+        current_size = max(min_font_size, current_size - 1)
+        _set_shape_font_size(shape, current_size)
+
+    if logger and current_size < font_size:
+        logger.write(
+            f"reduced font size id={item['id']} from {font_size:.1f} to {current_size:.1f}"
+        )
+
+
+# Fits generated text shapes by growing available box space, then shrinking text.
+def _fit_generated_text_shapes(slide, generated_text_ids, logger=None) -> None:
+    if not generated_text_ids:
+        return
+
+    for item in _text_shapes(slide):
+        if item["id"] not in generated_text_ids:
+            continue
+        if not item["text"].strip():
+            continue
+        if not _text_overflows_shape(item["shape"]):
+            continue
+
+        if logger:
+            logger.write(f"fit generated text shape {_item_summary(item)}")
+        _grow_text_shape_to_fit(slide, item, logger=logger)
+        _shrink_text_to_fit(item["shape"], item, logger=logger)
+
+
+# Sets all text shapes in a repeated role to the smallest current font size.
+def _normalize_font_size_for_ids(slide, shape_ids, role_name, logger=None) -> None:
+    shape_ids = set(shape_ids or [])
+    if not shape_ids:
+        return
+
+    items = [
+        item
+        for item in _text_shapes(slide)
+        if item["id"] in shape_ids and item["text"].strip() and item.get("font_size")
+    ]
+    if len(items) < 2:
+        return
+
+    target_size = min(item["font_size"] for item in items)
+    for item in items:
+        if abs(item["font_size"] - target_size) < 0.1:
+            continue
+        _set_shape_font_size(item["shape"], target_size)
+        if logger:
+            logger.write(
+                f"normalized {role_name} font size id={item['id']} "
+                f"from {item['font_size']:.1f} to {target_size:.1f}"
+            )
+
+
+# Deletes an unused text component plus nearby container/decorative shapes.
 def _delete_unused_component(slide, text_item, protected_ids=None, logger=None) -> None:
     protected_ids = set(protected_ids or [])
     shape_items = _all_shape_items(slide)
@@ -309,6 +552,7 @@ def _delete_unused_component(slide, text_item, protected_ids=None, logger=None) 
     return delete_ids
 
 
+# Finds the smallest non-text container shape around a text component.
 def _component_container(slide, text_item):
     shape_items = _all_shape_items(slide)
     text_box = {
@@ -333,268 +577,28 @@ def _component_container(slide, text_item):
     return min(containers, key=lambda item: item["area"]) if containers else None
 
 
-def _normalized_label(text: str) -> str:
-    return " ".join(text.lower().replace("\r", "\n").split())
-
-
-def _is_generic_component_label(text: str) -> bool:
-    label = _normalized_label(text)
-    if not label:
-        return False
-    words = label.split()
-    if len(words) > 4:
-        return False
-    if any(char.isdigit() for char in label):
-        return False
-    if any(word in label for word in ("company", "confidential", "date", "presenter")):
-        return False
-    if any(word in label for word in ("description", "supporting", "detail", "context")):
-        return False
-    if label in {"title", "subtitle", "section label", "category"}:
-        return False
-    return True
-
-
-def _repeated_component_items(shapes):
-    explicit_components = [
-        item
-        for item in shapes
-        if any(word in item["lower"] for word in REPEATED_COMPONENT_WORDS)
-    ]
-
-    label_counts = {}
-    for item in shapes:
-        label = _normalized_label(item["text"])
-        if _is_generic_component_label(label):
-            label_counts[label] = label_counts.get(label, 0) + 1
-
-    repeated_labels = {
-        label
-        for label, count in label_counts.items()
-        if count >= 2
-    }
-
-    generic_components = [
-        item
-        for item in shapes
-        if _normalized_label(item["text"]) in repeated_labels
-    ]
-
-    components_by_id = {
-        item["id"]: item
-        for item in explicit_components + generic_components
-    }
-    return sorted(components_by_id.values(), key=lambda item: (item["top"], item["left"]))
-
-
-def _fill_repeated_components(slide, components, values, protected_ids, logger=None):
-    used_ids = set()
-    deleted_ids = set()
-
-    for item, value in zip(components, values):
-        _set_shape_text(item["shape"], value)
-        if logger:
-            logger.write(f"fill repeated component {_item_summary(item)} with '{_preview(value)}'")
-        protected_ids.add(item["id"])
-        used_ids.add(item["id"])
-
-    for item in components[len(values):]:
-        if item["id"] in deleted_ids:
-            continue
-        description_item = description_by_component_id.get(item["id"])
-        if description_item is not None and description_item["id"] not in deleted_ids:
-            if logger:
-                logger.write(
-                    f"delete unused component description {_item_summary(description_item)}"
-                )
-            _delete_shape(description_item["shape"])
-            deleted_ids.add(description_item["id"])
-        deleted_ids.update(_delete_unused_component(slide, item, protected_ids=protected_ids, logger=logger))
-
-    return used_ids, deleted_ids
-
-
-def _line_count(text: str) -> int:
-    return len([line for line in text.replace("\r", "\n").splitlines() if line.strip()])
-
-
-def _word_count(text: str) -> int:
-    return len([word for word in text.replace("\r", "\n").split() if word.strip()])
-
-
-def _is_short_eyebrow(item) -> bool:
-    text = _normalized_label(item["text"])
-    if not text:
-        return False
-    if _word_count(text) <= 4 and item["height"] < 40:
-        return True
-    if any(word in text for word in ("chapter", "section", "part", "issue")) and _word_count(text) <= 5:
-        return True
-    return False
-
-
-def _is_drop_cap_item(item) -> bool:
-    text = item["text"].strip()
-    return len(text) == 1 and text.isalpha() and item["width"] <= 120 and item["height"] >= 60
-
-
-def _drop_cap_body_partner(drop_cap_item, shapes):
-    candidates = []
-    drop_right = drop_cap_item["left"] + drop_cap_item["width"]
-    drop_mid_y = drop_cap_item["top"] + drop_cap_item["height"] / 2
-
-    for item in shapes:
-        if item["id"] == drop_cap_item["id"]:
-            continue
-        if item["left"] < drop_cap_item["left"]:
-            continue
-        if item["left"] > drop_right + 160:
-            continue
-        item_mid_y = item["top"] + item["height"] / 2
-        if abs(item_mid_y - drop_mid_y) > max(drop_cap_item["height"], item["height"]):
-            continue
-        if _word_count(item["text"]) < 8:
-            continue
-        candidates.append(item)
-
-    return min(candidates, key=lambda item: abs(item["left"] - drop_right)) if candidates else None
-
-
-def _drop_cap_body_pair(shapes):
-    for item in shapes:
-        if not _is_drop_cap_item(item):
-            continue
-        partner = _drop_cap_body_partner(item, shapes)
-        if partner is not None:
-            return item, partner
-    return None, None
-
-
-def _looks_like_body_region(item) -> bool:
-    lower = item["lower"]
-    if "key point" in lower or "bullet" in lower:
-        return True
-    if _line_count(item["text"]) >= 4 and item["area"] > 1_000_000_000_000:
-        return True
-    return False
-
-
+# Detects placeholder/template text that should be removed after replacement.
 def _looks_like_template_text(text: str) -> bool:
     lower = text.lower()
     return any(word in lower for word in PLACEHOLDER_WORDS)
 
 
-def _looks_like_footer_text(text: str) -> bool:
-    label = _normalized_label(text)
-    if not label:
-        return False
-    if any(word in label for word in ("company", "confidential", "copyright")):
-        return True
-    if label.replace(" ", "").isdigit() and len(label.replace(" ", "")) <= 3:
-        return True
-    return False
-
-
+# Decides whether an unmapped content text shape should be deleted.
 def _should_delete_unmapped_content_text(slide, item) -> bool:
-    if _looks_like_footer_text(item["text"]):
+    if looks_like_footer_text(item["text"]):
         return False
 
     return True
 
 
-def _choose_title_shape(shapes):
-    def score(item):
-        lower = item["lower"]
-        value = item["area"] / 10000
-        if "presentation title" in lower:
-            value += 900
-        elif "title" in lower:
-            value += 500
-        if "category" in lower or "section label" in lower:
-            value -= 500
-        if "presenter" in lower or "date" in lower:
-            value -= 500
-        value -= item["top"] / 100
-        return value
-
-    return max(shapes, key=score) if shapes else None
-
-
-def _choose_subtitle_shape(shapes, title_shape):
-    title_top = title_shape["top"] if title_shape else -1
-
-    def score(item):
-        lower = item["lower"]
-        value = item["area"] / 20000
-        if "subtitle" in lower or "description" in lower:
-            value += 500
-        if item["top"] > title_top:
-            value += 100
-        if "presenter" in lower or "date" in lower:
-            value -= 500
-        return value
-
-    candidates = [item for item in shapes if item is not title_shape]
-    return max(candidates, key=score) if candidates else None
-
-
-def _choose_content_title_shape(shapes):
-    top_shapes = shapes[:5]
-
-    def score(item):
-        lower = item["lower"]
-        value = item["area"] / 10000
-        if "content slide title" in lower:
-            value += 1000
-        elif "title" in lower:
-            value += 600
-        if _is_short_eyebrow(item):
-            value -= 900
-        if _word_count(item["text"]) >= 3:
-            value += 250
-        if item["height"] >= 45:
-            value += 250
-        if "section label" in lower or "category" in lower:
-            value -= 700
-        if len(item["text"].splitlines()) > 2:
-            value -= 500
-        value -= item["top"] / 10
-        return value
-
-    return max(top_shapes or shapes, key=score) if shapes else None
-
-
-def _choose_content_body_shape(shapes, title_shape):
-    component_ids = {item["id"] for item in _repeated_component_items(shapes)}
-    drop_cap_item, drop_cap_partner = _drop_cap_body_pair(shapes)
-
-    def score(item):
-        lower = item["lower"]
-        value = item["area"] / 5000
-        if item is drop_cap_partner:
-            value += 1600
-        if item is drop_cap_item:
-            value -= 1600
-        if item["id"] in component_ids:
-            value -= 2000
-        if "key point" in lower or "add a sentence" in lower:
-            value += 1000
-        if item is title_shape:
-            value -= 2000
-        if item["top"] <= (title_shape["top"] if title_shape else 0):
-            value -= 500
-        return value
-
-    candidates = [item for item in shapes if item is not title_shape]
-    return max(candidates, key=score) if candidates else None
-
-
+# Formats generated bullet strings for a single body text box.
 def _format_body_text(bullets: list[str]) -> str:
     return "\r".join(bullets)
 
 
+# Writes bullets into a body shape, including special handling for drop-cap layouts.
 def _set_body_text(slide, body_shape, bullets: list[str], shapes, protected_ids, logger=None):
-    drop_cap_item, drop_cap_partner = _drop_cap_body_pair(shapes)
+    drop_cap_item, drop_cap_partner = drop_cap_body_pair(shapes)
     body_text = _format_body_text(bullets)
 
     if body_shape is drop_cap_partner and drop_cap_item is not None:
@@ -625,6 +629,7 @@ def _set_body_text(slide, body_shape, bullets: list[str], shapes, protected_ids,
         )
 
 
+# Protects the full visual card/container region around a repeated component.
 def _protect_component_region(slide, component_item, protected_ids):
     container = _component_container(slide, component_item)
     if container is None:
@@ -641,6 +646,7 @@ def _protect_component_region(slide, component_item, protected_ids):
             protected_ids.add(item["id"])
 
 
+# Finds the description text shape paired with a repeated card component.
 def _component_description_item(slide, component_item, all_text_items):
     container = _component_container(slide, component_item)
     if container is None:
@@ -656,6 +662,7 @@ def _component_description_item(slide, component_item, all_text_items):
     return max(candidates, key=lambda item: item["top"]) if candidates else None
 
 
+# Splits one bullet into card title and card description text.
 def _split_component_value(value: str) -> tuple[str, str]:
     value = " ".join(value.split())
     if not value:
@@ -666,12 +673,10 @@ def _split_component_value(value: str) -> tuple[str, str]:
             head, tail = value.split(separator, 1)
             if head and tail:
                 return head.strip(), tail.strip()
-    words = value.split()
-    if len(words) <= 6:
-        return value, ""
-    return " ".join(words[:6]), " ".join(words[6:])
+    return value, ""
 
 
+# Fills repeated card components with bullets and cleans up unused cards.
 def _fill_repeated_card_components(
     slide,
     components,
@@ -683,6 +688,8 @@ def _fill_repeated_card_components(
 ):
     used_ids = set()
     deleted_ids = set()
+    used_heading_ids = set()
+    used_description_ids = set()
     description_by_component_id = description_by_component_id or {}
 
     for item, value in zip(components, values):
@@ -698,6 +705,7 @@ def _fill_repeated_card_components(
             )
         protected_ids.add(item["id"])
         used_ids.add(item["id"])
+        used_heading_ids.add(item["id"])
 
         if description_item is not None:
             if description_text:
@@ -715,6 +723,7 @@ def _fill_repeated_card_components(
                     )
             protected_ids.add(description_item["id"])
             used_ids.add(description_item["id"])
+            used_description_ids.add(description_item["id"])
 
         _protect_component_region(slide, item, protected_ids)
 
@@ -723,9 +732,10 @@ def _fill_repeated_card_components(
             continue
         deleted_ids.update(_delete_unused_component(slide, item, protected_ids=protected_ids, logger=logger))
 
-    return used_ids, deleted_ids
+    return used_ids, deleted_ids, used_heading_ids, used_description_ids
 
 
+# Deletes repeated components that are not used by the chosen replacement strategy.
 def _delete_repeated_components(slide, components, protected_ids, logger=None):
     deleted_ids = set()
     for item in components:
@@ -735,6 +745,7 @@ def _delete_repeated_components(slide, components, protected_ids, logger=None):
     return deleted_ids
 
 
+# Replaces text on the duplicated title sample slide.
 def _replace_title_slide_text(slide, title: str, logger=None) -> None:
     shapes = _text_shapes(slide)
     shape_by_id = {item["id"]: item for item in shapes}
@@ -742,6 +753,7 @@ def _replace_title_slide_text(slide, title: str, logger=None) -> None:
     title_shape = shape_by_id.get(style.title_id)
     subtitle_shape = shape_by_id.get(style.subtitle_id)
     protected_ids = set()
+    generated_text_ids = set()
 
     if logger:
         logger.write(f"title slide text shape count={len(shapes)}")
@@ -759,20 +771,33 @@ def _replace_title_slide_text(slide, title: str, logger=None) -> None:
             if logger:
                 logger.write(f"set title shape id={item['id']} to '{_preview(title)}'")
             protected_ids.add(item["id"])
+            generated_text_ids.add(item["id"])
         elif item is subtitle_shape:
             _set_shape_text(item["shape"], "Generated with OpenAI")
             if logger:
                 logger.write(f"set subtitle shape id={item['id']} to 'Generated with OpenAI'")
             protected_ids.add(item["id"])
+            generated_text_ids.add(item["id"])
 
     deleted_ids = set()
     for item in shapes:
         if item["id"] in deleted_ids:
             continue
-        if item is not title_shape and item is not subtitle_shape and _looks_like_template_text(item["text"]):
-            deleted_ids.update(_delete_unused_component(slide, item, protected_ids=protected_ids, logger=logger))
+        if item is title_shape or item is subtitle_shape:
+            continue
+        if looks_like_footer_text(item["text"]):
+            if logger:
+                logger.write(f"preserve title footer text shape {_item_summary(item)}")
+            continue
+        if logger:
+            logger.write(f"delete unmapped title text shape {_item_summary(item)}")
+        _delete_shape(item["shape"])
+        deleted_ids.add(item["id"])
+
+    _fit_generated_text_shapes(slide, generated_text_ids, logger=logger)
 
 
+# Replaces text on a duplicated content sample slide.
 def _replace_content_slide_text(slide, title: str, bullets: list[str], logger=None) -> None:
     shapes = _text_shapes(slide)
     shape_by_id = {item["id"]: item for item in shapes}
@@ -794,8 +819,12 @@ def _replace_content_slide_text(slide, title: str, bullets: list[str], logger=No
     }
     use_body_region = style.use_body_region
     use_repeated_components = style.use_repeated_components
+    active_body_shape = body_shape if use_body_region else None
     protected_ids = set()
     deleted_ids = set()
+    generated_text_ids = set()
+    repeated_heading_ids = set()
+    repeated_description_ids = set()
 
     if logger:
         logger.write(f"content slide '{_preview(title)}' text shape count={len(shapes)}")
@@ -804,7 +833,7 @@ def _replace_content_slide_text(slide, title: str, bullets: list[str], logger=No
         logger.write(
             "content mapping: "
             f"title={_item_summary(title_shape) if title_shape else 'none'} | "
-            f"body={_item_summary(body_shape) if body_shape else 'none'} | "
+            f"body={_item_summary(active_body_shape) if active_body_shape else 'none'} | "
             f"use_body_region={use_body_region} | "
             f"repeated_count={len(repeated_components)} | "
             f"use_repeated_components={use_repeated_components}"
@@ -825,12 +854,19 @@ def _replace_content_slide_text(slide, title: str, bullets: list[str], logger=No
             if logger:
                 logger.write(f"set content title shape id={item['id']} to '{_preview(title)}'")
             protected_ids.add(item["id"])
-        elif use_body_region and item is body_shape:
-            _set_body_text(slide, body_shape, bullets, shapes, protected_ids, logger=logger)
+            generated_text_ids.add(item["id"])
+        elif item is active_body_shape:
+            _set_body_text(slide, active_body_shape, bullets, shapes, protected_ids, logger=logger)
+            generated_text_ids.update(protected_ids)
 
     filled_component_ids = set()
     if use_repeated_components:
-        filled_component_ids, component_deleted_ids = _fill_repeated_card_components(
+        (
+            filled_component_ids,
+            component_deleted_ids,
+            repeated_heading_ids,
+            repeated_description_ids,
+        ) = _fill_repeated_card_components(
             slide,
             repeated_components,
             bullets,
@@ -840,6 +876,7 @@ def _replace_content_slide_text(slide, title: str, bullets: list[str], logger=No
             description_by_component_id=description_by_component_id,
         )
         deleted_ids.update(component_deleted_ids)
+        generated_text_ids.update(filled_component_ids)
     elif repeated_components:
         if logger:
             logger.write("body region selected; deleting unused repeated components")
@@ -852,7 +889,7 @@ def _replace_content_slide_text(slide, title: str, bullets: list[str], logger=No
             continue
         if item["id"] in protected_ids:
             continue
-        if item is title_shape or item is body_shape:
+        if item is title_shape or item is active_body_shape:
             continue
 
         if _looks_like_template_text(item["text"]):
@@ -865,7 +902,13 @@ def _replace_content_slide_text(slide, title: str, bullets: list[str], logger=No
         elif logger:
             logger.write(f"preserve unmapped text shape {_item_summary(item)}")
 
+    _fit_generated_text_shapes(slide, generated_text_ids, logger=logger)
+    _normalize_font_size_for_ids(slide, repeated_heading_ids, "repeated heading", logger=logger)
+    _normalize_font_size_for_ids(slide, repeated_description_ids, "repeated description", logger=logger)
+    _fit_generated_text_shapes(slide, generated_text_ids, logger=logger)
 
+
+# Writes speaker notes after COM save using python-pptx.
 def _write_notes_with_python_pptx(output_file: Path, plan) -> None:
     prs = Presentation(output_file)
 
@@ -883,6 +926,7 @@ def _write_notes_with_python_pptx(output_file: Path, plan) -> None:
     prs.save(output_file)
 
 
+# Builds a presentation by duplicating detected sample slides through PowerPoint COM.
 def build_presentation_from_template_com(
     plan,
     output_file,
@@ -911,8 +955,6 @@ def build_presentation_from_template_com(
     logger.write(f"output_file={output_file}")
     logger.write(
         "profile: "
-        f"title_layout={profile.title_layout_index} ({profile.title_layout_name}), "
-        f"content_layout={profile.content_layout_index} ({profile.content_layout_name}), "
         f"title_slide={profile.title_slide_index}, content_slide={profile.content_slide_index}, "
         f"confidence={profile.confidence:.2f}, reason={profile.selection_reason}"
     )

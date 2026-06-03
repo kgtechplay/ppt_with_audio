@@ -23,6 +23,12 @@ Do not include markdown.
 """
 
 
+def safe_print(text: str) -> None:
+    encoding = sys.stdout.encoding or "utf-8"
+    safe_text = text.encode(encoding, errors="replace").decode(encoding)
+    print(safe_text, flush=True)
+
+
 def load_file(path):
     return Path(path).read_text(encoding="utf-8")
 
@@ -124,7 +130,7 @@ def build_presentation_with_optional_template(
         detection_report_path = logs_dir / f"{output_file.stem}_template_detection.log"
         detection_report = format_template_detection_report(template_path, profile)
         detection_report_path.write_text(detection_report, encoding="utf-8")
-        print(detection_report, flush=True)
+        safe_print(detection_report)
 
         if not profile.title_slide_index or not profile.content_slide_index:
             raise ValueError("Could not identify title and content sample slides in template.")
@@ -146,7 +152,7 @@ def build_presentation_with_optional_template(
             "Falling back to default PowerPoint layout.\n"
         )
         fallback_log_path.write_text(fallback_message, encoding="utf-8")
-        print(fallback_message, flush=True)
+        safe_print(fallback_message)
         if progress_callback:
             progress_callback(
                 2,
